@@ -21,60 +21,10 @@ python -m pip install torch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 \
 python -m pip install numpy==1.23.2 scipy==1.10.1 Cython==0.29.37
 python -m pip install --no-use-pep517 --no-build-isolation scikit-learn==0.21.3
 python -m pip install -r requirements.txt
-```
-
-The original environment uses `scikit-learn==0.21.3`. With SciPy 1.10.1, apply the original `pinv2` to `pinv` replacement in its PLS module after installation. The commands below locate the active environment's package and keep a backup; running them again is safe:
-
-```bash
-python - <<'PY'
-from importlib.metadata import distribution
-from pathlib import Path
-
-package = distribution("scikit-learn")
-assert package.version == "0.21.3", package.version
-path = Path(package.locate_file("sklearn/cross_decomposition/pls_.py"))
-original = path.read_text()
-patched = original.replace("pinv2", "pinv")
-assert "from scipy.linalg import pinv, svd" in patched, "Unexpected sklearn PLS source"
-if patched != original:
-    backup = path.with_name(path.name + ".bak")
-    if not backup.exists():
-        backup.write_bytes(path.read_bytes())
-    path.write_text(patched)
-print("sklearn PLS ready:", path)
-PY
-python - <<'PY'
-import scipy.linalg
-import sklearn
-from sklearn.cross_decomposition import pls_
-from sklearn.model_selection import train_test_split
-
-assert sklearn.__version__ == "0.21.3", sklearn.__version__
-assert pls_.pinv is scipy.linalg.pinv
-print("sklearn import and PLS compatibility check passed")
-PY
 python -m pip check
 ```
 
-The launchers set the local import paths; no `pip install -e .` step is needed. Use the pinned PyTorch 2.0.1 / CUDA 11.8 environment and dependencies, particularly `pymoo==0.5.0`, for the benchmark experiments. The PyTorch command follows the [official installation instructions](https://pytorch.org/get-started/previous-versions/#v201).
-
-`requirements.txt` includes `gin-config`, `einops`, `pygmo`, `accelerate`, and `torchdiffeq`, which PCD uses. Notebook kernels, POT, SwanLab, and OpenCV are optional tools from the original setup; the included experiment launchers do not require them.
-
-<details>
-<summary>Optional notebook and utility packages</summary>
-
-These versions work with Python 3.8 and the pinned NumPy/SciPy versions:
-
-```bash
-python -m pip install -c requirements.txt ipykernel==6.29.5 swanlab==0.7.20
-python -m pip install -c requirements.txt --no-build-isolation POT==0.9.5
-python -m pip install --no-deps opencv-python-headless==4.8.1.78
-python -m pip check
-```
-
-PCD's optimal-transport coupling does not depend on POT. The baseline scripts use W&B directly; installing SwanLab does not enable automatic W&B-to-SwanLab synchronization.
-
-</details>
+Complete the [scikit-learn compatibility step](#scikit-learn-compatibility) below after installation. MuJoCo is only needed for Hopper and Swimmer.
 
 Download the [Off-MOO-Bench datasets](https://drive.google.com/drive/folders/1SvU-p4Q5KAjPlHrDJ0VGiU2Te_v9g3rT) and extract them under `experiments/offline_moo/data/`, preserving the task folders and filenames. These offline samples are required for all tasks, including RE, DTLZ, and ZDT. Checkpoints are produced by training.
 
@@ -110,7 +60,7 @@ DRY_RUN=1 TASKS="zdt2" SEEDS="0" RFM_STAGE1_STEERING_MODE=soft_spectral \
 
 The paper compares AN, APG, DAMG, and Cone against 14 baselines. CRD-Reduced is an additional variant available here. All five share the same trained flow and predictors.
 
-After completing both NAS and MORL backend setup, run the full benchmark with the four RFM methods and soft steering used in the paper (Appendix A.3, Table 4). Leave `TASKS` unset; the commands below select all 47 tasks and seeds `0 1 2 3 4`:
+To run the four RFM methods on all 47 tasks with seeds `0 1 2 3 4`, first complete the NAS and MORL setup below:
 
 ```bash
 GPUS="0 1 2 3" THREADS=8 TASK_GROUP=all SEEDS="0 1 2 3 4" ACTION=all \
@@ -131,11 +81,11 @@ GPUS="0" TASKS="zdt2" SEEDS="0" \
   bash scripts/sample_rfm.sh
 ```
 
-The examples above explicitly select `soft_spectral`, as in the paper. Without that override, the sampler follows the original general-purpose launcher: AN and APG use hard Stage-1 steering; DAMG, CRD-Reduced, and Cone use soft-spectral steering. `RFM_STAGE1_STEERING_MODE=adaptive_hard` selects hard Stage-1 steering for all methods. APG's Stage-2 projector follows the same choice; DAMG retains its online soft filter.
+The paper uses `soft_spectral` steering. By default, AN and APG use hard Stage-1 steering; DAMG, CRD-Reduced, and Cone use soft-spectral steering. Set `RFM_STAGE1_STEERING_MODE=adaptive_hard` to use hard Stage-1 steering for all methods. APG's Stage-2 projector uses the same mode; DAMG uses an online soft filter.
 
 The main settings are steering strength 10, soft exponent 0.3, 256 preference weights, two noise draws per weight, and a final budget of 256 solutions. Invalid candidates and oracle outputs are filtered, so the returned set can be smaller. RFM geometry is cached; APG also fits Stage-2 geometry. Proxy predictions select candidates, and oracle objectives evaluate them.
 
-CRD-Reduced and Cone use the batched simplex QP solver in `experiments/crd_solver.py` for consensus with more than two objectives and the Cone fallback. The two-objective closed form is retained. For three or more objectives, results can differ from the earlier approximate Frank–Wolfe solver.
+CRD-Reduced and Cone use a batched simplex QP solver for consensus with more than two objectives and for the Cone fallback. Two-objective consensus uses a closed-form solution.
 
 ## Baselines
 
@@ -262,8 +212,47 @@ These evaluator assets are separate from the offline datasets in `experiments/of
 
 </details>
 
+### MORL
+
 <details>
-<summary><strong>MORL: MuJoCo for Hopper and Swimmer</strong></summary>
+<summary>Hopper and Swimmer setup</summary>
+
+#### scikit-learn compatibility
+
+The shared environment needs this fix for `scikit-learn==0.21.3` with SciPy 1.10.1:
+
+```bash
+python - <<'PY'
+from importlib.metadata import distribution
+from pathlib import Path
+
+package = distribution("scikit-learn")
+assert package.version == "0.21.3", package.version
+path = Path(package.locate_file("sklearn/cross_decomposition/pls_.py"))
+original = path.read_text()
+patched = original.replace("pinv2", "pinv")
+assert "from scipy.linalg import pinv, svd" in patched, "Unexpected sklearn PLS source"
+if patched != original:
+    backup = path.with_name(path.name + ".bak")
+    if not backup.exists():
+        backup.write_bytes(path.read_bytes())
+    path.write_text(patched)
+print("sklearn PLS ready:", path)
+PY
+python - <<'PY'
+import scipy.linalg
+import sklearn
+from sklearn.cross_decomposition import pls_
+from sklearn.model_selection import train_test_split
+
+assert sklearn.__version__ == "0.21.3", sklearn.__version__
+assert pls_.pinv is scipy.linalg.pinv
+print("sklearn import and PLS compatibility check passed")
+PY
+python -m pip check
+```
+
+#### MuJoCo
 
 The evaluators require **MuJoCo 2.1.0** with `mujoco-py`. Install the native libraries and Python dependencies in the Conda environment:
 
@@ -277,7 +266,7 @@ tar -xzf /tmp/mujoco210-linux-x86_64.tar.gz -C "$HOME/.mujoco"
 python -m pip install -r requirements-morl.txt
 ```
 
-After activating `ctrl-moo`, set the library paths in each shell used for MORL. The NVIDIA directory below follows `mujoco-py`'s own detection rules and preserves any driver paths already supplied by your server:
+Set the library paths in each shell used for MORL:
 
 ```bash
 export MUJOCO_PY_MUJOCO_PATH="$HOME/.mujoco/mujoco210"
@@ -302,9 +291,9 @@ PY
 export LD_LIBRARY_PATH="${MUJOCO_NVIDIA_LIB_DIR:+$MUJOCO_NVIDIA_LIB_DIR:}$MUJOCO_PY_MUJOCO_PATH/bin:$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 ```
 
-Keep GCC 11, Cython 0.29, and the Mesa pin: the CPU fallback needs OSMesa, which newer Mesa packages no longer provide. `libgl-devel` supplies the linker library. See the [mujoco-py installation notes](https://github.com/openai/mujoco-py#install-mujoco) for host-specific OpenGL setup.
+The pinned Mesa package provides OSMesa for CPU rendering. See [mujoco-py](https://github.com/openai/mujoco-py#install-mujoco) for host-specific OpenGL setup.
 
-For NVIDIA/EGL builds, repair the legacy `eglshim.c` before the first import. The patch adds missing C headers, corrects the `fprintf` call, and casts the pixel-buffer offsets to pointers. It targets `mujoco-py==2.1.2.14`, keeps a `.bak` copy, and can be run again safely:
+For NVIDIA GPUs, apply this EGL fix before importing `mujoco_py`:
 
 ```bash
 python - <<'PY'
@@ -343,7 +332,7 @@ print("EGL shim ready:", path)
 PY
 ```
 
-Rebuild the extension after patching. The compatibility flags apply only to this command and preserve Conda's existing compiler flags. `MUJOCO_PY_FORCE_REBUILD` rebuilds the selected extension in the installed package's `generated/` directory:
+Build the MuJoCo extension:
 
 ```bash
 CFLAGS="${CFLAGS-} -Wno-error=incompatible-pointer-types" \
@@ -364,7 +353,7 @@ print('MuJoCo physics initialization passed')
 PY
 ```
 
-On a server with an allocated NVIDIA GPU, also check EGL offscreen rendering. Use the appropriate EGL device index in place of `0`; it is not necessarily the logical PyTorch index after `CUDA_VISIBLE_DEVICES` remapping. Leave `MUJOCO_PY_FORCE_CPU` unset for this GPU check:
+Check offscreen rendering on an NVIDIA GPU with `MUJOCO_PY_FORCE_CPU` unset. Set `device_id` to your EGL device index, which may differ from PyTorch's GPU numbering:
 
 ```bash
 python - <<'PY'
@@ -381,14 +370,23 @@ print("GPU EGL offscreen rendering passed")
 PY
 ```
 
-The benchmark data must also include the policy-parameter shape metadata:
+The MORL data folders must include:
 
 ```text
 experiments/offline_moo/data/mo_hopper_v2/params_shapes.pkl
 experiments/offline_moo/data/mo_swimmer_v2/params_shapes.pkl
 ```
 
-Keep the evaluator assets bundled with the MORL backend. The physics and rendering checks do not check these task-specific files.
+#### Optional tools
+
+For notebooks and additional utilities:
+
+```bash
+python -m pip install -c requirements.txt ipykernel==6.29.5 swanlab==0.7.20
+python -m pip install -c requirements.txt --no-build-isolation POT==0.9.5
+python -m pip install --no-deps opencv-python-headless==4.8.1.78
+python -m pip check
+```
 
 </details>
 
