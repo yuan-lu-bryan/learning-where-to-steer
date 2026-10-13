@@ -1,0 +1,5 @@
+# Optional GP-based baselines retained from Off-MOO-Bench; not in paper Table 1.
+botorch==0.8.5
+gpytorch==1.10
+linear-operator==0.4.0
+pyro-ppl==1.8.6

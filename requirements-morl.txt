@@ -1,0 +1,9 @@
+# Install after the core environment and MuJoCo 2.1.0 native libraries.
+Cython==0.29.37
+gym==0.14.0
+mujoco-py==2.1.2.14
+cffi==1.16.0
+imageio==2.34.0
+glfw==2.7.0
+PyOpenGL==3.1.7
+

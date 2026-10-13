@@ -1,0 +1,5 @@
+# Additional Python dependencies for the C-10/MOP and IN-1K/MOP tasks.
+# EvoXBench's separate database/data downloads are also required; see README.md.
+evoxbench==1.0.3
+Django==4.2.9
+

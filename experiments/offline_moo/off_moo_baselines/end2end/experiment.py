@@ -1,0 +1,329 @@
+import datetime
+import json
+import os
+import sys
+
+
+import numpy as np
+import pandas as pd
+import wandb
+
+BASE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
+sys.path.append(BASE_PATH)
+
+from pymoo.algorithms.moo.nsga2 import NSGA2
+
+import off_moo_bench as ob
+from off_moo_baselines.data import get_dataloader, tkwargs
+from off_moo_baselines.end2end.nets import End2EndModel
+from off_moo_baselines.end2end.surrogate_problem import End2EndSurrogateProblem
+from off_moo_baselines.end2end.trainer import get_trainer
+from off_moo_baselines.mo_solver.callback import RecordCallback
+from off_moo_baselines.mo_solver.moea_solver import MOEASolver
+from off_moo_bench.collecter import get_operator_dict
+from off_moo_bench.evaluation.metrics import hv, igd
+from off_moo_bench.evaluation.plot import plot_y
+from off_moo_bench.task_set import *
+from utils import get_quantile_solutions, set_seed
+
+
+def run(config: dict):
+    if config["task"] in ALLTASKSDICT.keys():
+        config["task"] = ALLTASKSDICT[config["task"]]
+
+    results_dir = os.path.join(
+        config["results_dir"],
+        f"{config['model']}-{config['train_mode']}-{config['task']}",
+    )
+    config["results_dir"] = results_dir
+    os.makedirs(config["results_dir"], exist_ok=True)
+
+    run_name = f"{config['model']}-{config['train_mode']}-seed{config['seed']}-{config['task']}"
+
+    logging_dir = os.path.join(config["results_dir"], run_name)
+    os.makedirs(logging_dir, exist_ok=True)
+
+    if config["use_wandb"]:
+        if "wandb_api" in config.keys():
+            wandb.login(key=config["wandb_api"])
+
+        wandb.init(
+            project="Offline-MOO-Formal",
+            name=run_name,
+            config=config,
+            group=f"{config['model']}-{config['train_mode']}",
+            job_type=config["run_type"],
+            mode="offline",
+            dir=os.path.join(config["results_dir"], ".."),
+        )
+
+    with open(os.path.join(logging_dir, "params.json"), "w") as f:
+        json.dump(config, f, indent=4)
+
+    set_seed(config["seed"])
+
+    task = ob.make(
+        config["task"],
+        dataset_kwargs={
+            "x_normalize_method": "z-score",
+            "y_normalize_method": "z-score",
+        },
+    )
+
+    X = task.x.copy()
+    y = task.y.copy()
+
+    if config["data_pruning"]:
+        X, y = task.get_N_non_dominated_solutions(
+            N=int(X.shape[0] * config["data_preserved_ratio"]),
+            return_x=True,
+            return_y=True,
+        )
+
+    X_test = task.x_test.copy()
+    y_test = task.y_test.copy()
+
+    if config["to_logits"]:
+        assert task.is_discrete
+        X = task.to_logits(X)
+        X_test = task.to_logits(X_test)
+    if config["normalize_xs"]:
+        X = task.normalize_x(X)
+        X_test = task.normalize_x(X_test)
+    if config["normalize_ys"]:
+        y = task.normalize_y(y)
+        y_test = task.normalize_y(y_test)
+
+    data_size, n_dim = tuple(X.shape)
+    n_obj = y.shape[1]
+
+    model_save_dir = config["model_save_dir"]
+    os.makedirs(model_save_dir, exist_ok=True)
+
+    model_save_path = os.path.join(
+        model_save_dir,
+        f"{config['model']}-{config['train_mode']}-{config['task']}-{config['seed']}.pt",
+    )
+
+    model = End2EndModel(
+        n_dim=n_dim,
+        n_obj=n_obj,
+        hidden_size=[2048, 2048],
+        save_path=model_save_path,
+    ).to(**tkwargs)
+
+    trainer_func = get_trainer(config["train_mode"])
+
+    trainer = trainer_func(forward_model=model, config=config)
+
+    (train_loader, val_loader, test_loader) = get_dataloader(
+        X, y, X_test, y_test, val_ratio=0.9, batch_size=config["batch_size"]
+    )
+
+    trainer.launch(
+        train_loader, val_loader, test_loader, retrain_model=config["retrain_model"]
+    )
+
+    surrogate_problem = End2EndSurrogateProblem(
+        n_var=n_dim,
+        n_obj=n_obj,
+        model=model,
+        task=task,
+    )
+
+    callback = RecordCallback(
+        task=task,
+        surrogate_problem=surrogate_problem,
+        config=config,
+        logging_dir=logging_dir,
+        iters_to_record=1,
+    )
+
+    genetic_operators = get_operator_dict(config)
+
+    solver = MOEASolver(
+        n_gen=config["solver_n_gen"],
+        pop_init_method=config["solver_init_method"],
+        batch_size=config["num_solutions"],
+        pop_size=config["num_solutions"],
+        algo=NSGA2,
+        callback=callback if config["record_hist"] else None,
+        eliminate_duplicates=True,
+        **genetic_operators,
+    )
+
+    pass_x = (
+        task.normalize_x(task.denormalize_x(X), normalization_method="min-max")
+        if config["normalize_xs"]
+        else X
+    )
+    pass_y = (
+        task.normalize_y(task.denormalize_y(y), normalization_method="min-max")
+        if config["normalize_ys"]
+        else y
+    )
+
+    res = solver.solve(
+        surrogate_problem,
+        X=pass_x,
+        Y=pass_y,
+    )
+
+    res_x = res["x"]
+    res_x = (
+        task.denormalize_x(res_x, normalization_method="min-max")
+        if config["normalize_xs"]
+        else res_x
+    )
+    if config["to_logits"]:
+        res_x = task.to_integers(res_x)
+
+    res_y = task.predict(res_x)
+    visible_masks = np.ones(len(res_y))
+    visible_masks[np.where(np.logical_or(np.isinf(res_y), np.isnan(res_y)))[0]] = 0
+    visible_masks[np.where(np.logical_or(np.isinf(res_x), np.isnan(res_x)))[0]] = 0
+    res_x = res_x[np.where(visible_masks == 1)[0]]
+    res_y = res_y[np.where(visible_masks == 1)[0]]
+
+    if len(res_y) == 0:
+        print(
+            "[Warning] No valid solutions remain after task.predict + finite filtering."
+        )
+
+        np.save(file=os.path.join(logging_dir, "res_x.npy"), arr=res_x)
+        np.save(file=os.path.join(logging_dir, "res_y.npy"), arr=res_y)
+
+        failure_info = {
+            "status": "no_valid_solutions_after_predict",
+            "task": config["task"],
+            "model": config["model"],
+            "train_mode": config["train_mode"],
+            "seed": int(config["seed"]),
+        }
+        with open(os.path.join(logging_dir, "failure_info.json"), "w") as f:
+            json.dump(failure_info, f, indent=4)
+
+        hv_results = {
+            "hypervolume/D(best)": 0.0,
+            "hypervolume/100th": 0.0,
+            "hypervolume/75th": 0.0,
+            "hypervolume/50th": 0.0,
+            "status": "no_valid_solutions_after_predict",
+        }
+        with open(os.path.join(logging_dir, "hv_results.json"), "w") as f:
+            json.dump(hv_results, f, indent=4)
+
+        metrics = hv_results
+
+        pareto_front = task.problem.get_pareto_front()
+        if pareto_front is not None:
+            igd_results = {
+                "igd/D(best)": 0.0,
+                "igd/100th": 0.0,
+                "igd/75th": 0.0,
+                "igd/50th": 0.0,
+            }
+            with open(os.path.join(logging_dir, "igd_results.json"), "w") as f:
+                json.dump(igd_results, f, indent=4)
+            metrics = {**metrics, **igd_results}
+
+        if config["use_wandb"]:
+            wandb.log(metrics)
+
+        return
+
+    res_y_75_percent = get_quantile_solutions(res_y, 0.75)
+    res_y_50_percent = get_quantile_solutions(res_y, 0.50)
+
+    nadir_point = task.nadir_point
+    pareto_front = task.problem.get_pareto_front()
+
+    _, d_best = task.get_N_non_dominated_solutions(
+        N=config["num_solutions"], return_x=False, return_y=True
+    )
+
+    if config["normalize_ys"]:
+        res_y = task.normalize_y(res_y, normalization_method="min-max")
+        nadir_point = task.normalize_y(nadir_point, normalization_method="min-max")
+        res_y_50_percent = task.normalize_y(
+            res_y_50_percent, normalization_method="min-max"
+        )
+        res_y_75_percent = task.normalize_y(
+            res_y_75_percent, normalization_method="min-max"
+        )
+        d_best = task.normalize_y(d_best, normalization_method="min-max")
+        if pareto_front is not None:
+            pareto_front = task.normalize_y(
+                pareto_front, normalization_method="min-max"
+            )
+
+    nadir_point = nadir_point.reshape(
+        -1,
+    )
+
+    np.save(file=os.path.join(logging_dir, "res_x.npy"), arr=res_x)
+    np.save(file=os.path.join(logging_dir, "res_y.npy"), arr=res_y)
+    plot_y(
+        res_y,
+        save_dir=logging_dir,
+        config=config,
+        nadir_point=nadir_point,
+        d_best=d_best,
+    )
+
+    d_best_hv = hv(nadir_point, d_best, config["task"])
+    hv_value = hv(nadir_point, res_y, config["task"])
+    hv_value_50_percentile = hv(nadir_point, res_y_50_percent, config["task"])
+    hv_value_75_percentile = hv(nadir_point, res_y_75_percent, config["task"])
+
+    print(f"Hypervolume (100th): {hv_value:4f}")
+    print(f"Hypervolume (75th): {hv_value_75_percentile:4f}")
+    print(f"Hypervolume (50th): {hv_value_50_percentile:4f}")
+    print(f"Hypervolume (D(best)): {d_best_hv:4f}")
+
+    hv_results = {
+        "hypervolume/D(best)": d_best_hv,
+        "hypervolume/100th": hv_value,
+        "hypervolume/75th": hv_value_75_percentile,
+        "hypervolume/50th": hv_value_50_percentile,
+    }
+
+    with open(os.path.join(logging_dir, "hv_results.json"), "w") as f:
+        json.dump(hv_results, f, indent=4)
+
+    metrics = hv_results
+
+    if pareto_front is not None:
+        d_best_igd = igd(pareto_front, d_best)
+        res_igd = igd(pareto_front, res_y)
+        res_igd_75_percent = igd(pareto_front, res_y_75_percent)
+        res_igd_50_percent = igd(pareto_front, res_y_50_percent)
+        igd_results = {
+            "igd/D(best)": d_best_igd,
+            "igd/100th": res_igd,
+            "igd/75th": res_igd_75_percent,
+            "igd/50th": res_igd_50_percent,
+        }
+        with open(os.path.join(logging_dir, "igd_results.json"), "w") as f:
+            json.dump(igd_results, f, indent=4)
+        metrics = {**metrics, **igd_results}
+
+    if config["use_wandb"]:
+        wandb.log(metrics)
+
+
+if __name__ == "__main__":
+    from utils import process_args
+
+    config = process_args(return_dict=True)
+
+    results_dir = os.path.join(BASE_PATH, "results", "end2end")
+    model_save_dir = os.path.join(BASE_PATH, "model", "end2end")
+
+    os.makedirs(results_dir, exist_ok=True)
+    os.makedirs(model_save_dir, exist_ok=True)
+
+    config["results_dir"] = results_dir
+    config["model_save_dir"] = model_save_dir
+
+    run(config)

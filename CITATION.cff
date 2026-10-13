@@ -1,0 +1,32 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite the paper below."
+type: software
+title: "Learning Where to Steer: Noise-Space Geometry for Efficient Offline Multi-Objective Optimization with Generative Models"
+authors:
+  - family-names: Lu
+    given-names: Yuan
+  - family-names: Singh
+    given-names: Esha
+  - family-names: Ma
+    given-names: Yi-An
+  - family-names: Wang
+    given-names: Yusu
+url: "https://arxiv.org/abs/2609.38920"
+preferred-citation:
+  type: article
+  title: "Learning Where to Steer: Noise-Space Geometry for Efficient Offline Multi-Objective Optimization with Generative Models"
+  authors:
+    - family-names: Lu
+      given-names: Yuan
+    - family-names: Singh
+      given-names: Esha
+    - family-names: Ma
+      given-names: Yi-An
+    - family-names: Wang
+      given-names: Yusu
+  journal: arXiv
+  year: 2026
+  url: "https://arxiv.org/abs/2609.38920"
+  identifiers:
+    - type: other
+      value: "arXiv:2609.38920"

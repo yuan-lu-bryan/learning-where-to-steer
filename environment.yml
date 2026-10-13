@@ -1,0 +1,16 @@
+# Linux x86_64 research environment. Install PyTorch and requirements.txt next;
+# see README.md. Dataset backends for NAS and MORL have additional assets.
+name: ctrl-moo
+channels:
+  - conda-forge
+dependencies:
+  - python=3.8.18
+  - pip=23.3.2
+  - setuptools=65.5.0
+  - wheel=0.38.4
+  - gcc_linux-64=11
+  - gxx_linux-64=11
+  - libxcrypt
+  - patchelf
+  - pkg-config
+  - git
