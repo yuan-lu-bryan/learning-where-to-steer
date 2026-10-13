@@ -18,12 +18,63 @@ conda env create -f environment.yml
 conda activate ctrl-moo
 python -m pip install torch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 \
   --index-url https://download.pytorch.org/whl/cu118
-python -m pip install numpy==1.23.2 Cython==0.29.37
+python -m pip install numpy==1.23.2 scipy==1.10.1 Cython==0.29.37
+python -m pip install --no-use-pep517 --no-build-isolation scikit-learn==0.21.3
 python -m pip install -r requirements.txt
+```
+
+The original environment uses `scikit-learn==0.21.3`. With SciPy 1.10.1, apply the original `pinv2` to `pinv` replacement in its PLS module after installation. The commands below locate the active environment's package and keep a backup; running them again is safe:
+
+```bash
+python - <<'PY'
+from importlib.metadata import distribution
+from pathlib import Path
+
+package = distribution("scikit-learn")
+assert package.version == "0.21.3", package.version
+path = Path(package.locate_file("sklearn/cross_decomposition/pls_.py"))
+original = path.read_text()
+patched = original.replace("pinv2", "pinv")
+assert "from scipy.linalg import pinv, svd" in patched, "Unexpected sklearn PLS source"
+if patched != original:
+    backup = path.with_name(path.name + ".bak")
+    if not backup.exists():
+        backup.write_bytes(path.read_bytes())
+    path.write_text(patched)
+print("sklearn PLS ready:", path)
+PY
+python - <<'PY'
+import scipy.linalg
+import sklearn
+from sklearn.cross_decomposition import pls_
+from sklearn.model_selection import train_test_split
+
+assert sklearn.__version__ == "0.21.3", sklearn.__version__
+assert pls_.pinv is scipy.linalg.pinv
+print("sklearn import and PLS compatibility check passed")
+PY
 python -m pip check
 ```
 
 The launchers set the local import paths; no `pip install -e .` step is needed. Use the pinned PyTorch 2.0.1 / CUDA 11.8 environment and dependencies, particularly `pymoo==0.5.0`, for the benchmark experiments. The PyTorch command follows the [official installation instructions](https://pytorch.org/get-started/previous-versions/#v201).
+
+`requirements.txt` includes `gin-config`, `einops`, `pygmo`, `accelerate`, and `torchdiffeq`, which PCD uses. Notebook kernels, POT, SwanLab, and OpenCV are optional tools from the original setup; the included experiment launchers do not require them.
+
+<details>
+<summary>Optional notebook and utility packages</summary>
+
+These versions work with Python 3.8 and the pinned NumPy/SciPy versions:
+
+```bash
+python -m pip install -c requirements.txt ipykernel==6.29.5 swanlab==0.7.20
+python -m pip install -c requirements.txt --no-build-isolation POT==0.9.5
+python -m pip install --no-deps opencv-python-headless==4.8.1.78
+python -m pip check
+```
+
+PCD's optimal-transport coupling does not depend on POT. The baseline scripts use W&B directly; installing SwanLab does not enable automatic W&B-to-SwanLab synchronization.
+
+</details>
 
 Download the [Off-MOO-Bench datasets](https://drive.google.com/drive/folders/1SvU-p4Q5KAjPlHrDJ0VGiU2Te_v9g3rT) and extract them under `experiments/offline_moo/data/`, preserving the task folders and filenames. These offline samples are required for all tasks, including RE, DTLZ, and ZDT. Checkpoints are produced by training.
 
@@ -223,15 +274,85 @@ mkdir -p "$HOME/.mujoco"
 curl -fL https://github.com/google-deepmind/mujoco/releases/download/2.1.0/mujoco210-linux-x86_64.tar.gz \
   -o /tmp/mujoco210-linux-x86_64.tar.gz
 tar -xzf /tmp/mujoco210-linux-x86_64.tar.gz -C "$HOME/.mujoco"
-
-export MUJOCO_PY_MUJOCO_PATH="$HOME/.mujoco/mujoco210"
-export LD_LIBRARY_PATH="$MUJOCO_PY_MUJOCO_PATH/bin:$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 python -m pip install -r requirements-morl.txt
 ```
 
-Set both environment variables in each shell used for MORL, preserving any NVIDIA driver-library paths supplied by your cluster. Keep GCC 11, Cython 0.29, and the Mesa pin: `mujoco-py` needs OSMesa, which newer Mesa packages no longer provide. `libgl-devel` supplies the linker library. See the [mujoco-py installation notes](https://github.com/openai/mujoco-py#install-mujoco) for host-specific OpenGL setup.
+After activating `ctrl-moo`, set the library paths in each shell used for MORL. The NVIDIA directory below follows `mujoco-py`'s own detection rules and preserves any driver paths already supplied by your server:
 
-Check physics initialization before launching experiments:
+```bash
+export MUJOCO_PY_MUJOCO_PATH="$HOME/.mujoco/mujoco210"
+MUJOCO_NVIDIA_LIB_DIR=$(python - <<'PY'
+import glob
+import os
+import shutil
+
+path = ""
+if shutil.which("nvidia-smi"):
+    for candidate in ("/usr/local/nvidia/lib64", "/usr/lib/nvidia"):
+        if os.path.isdir(candidate):
+            path = candidate
+            break
+    if not path:
+        candidates = sorted(glob.glob("/usr/lib/nvidia-[0-9][0-9][0-9]"))
+        if candidates:
+            path = candidates[-1]
+print(path)
+PY
+)
+export LD_LIBRARY_PATH="${MUJOCO_NVIDIA_LIB_DIR:+$MUJOCO_NVIDIA_LIB_DIR:}$MUJOCO_PY_MUJOCO_PATH/bin:$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+```
+
+Keep GCC 11, Cython 0.29, and the Mesa pin: the CPU fallback needs OSMesa, which newer Mesa packages no longer provide. `libgl-devel` supplies the linker library. See the [mujoco-py installation notes](https://github.com/openai/mujoco-py#install-mujoco) for host-specific OpenGL setup.
+
+For NVIDIA/EGL builds, repair the legacy `eglshim.c` before the first import. The patch adds missing C headers, corrects the `fprintf` call, and casts the pixel-buffer offsets to pointers. It targets `mujoco-py==2.1.2.14`, keeps a `.bak` copy, and can be run again safely:
+
+```bash
+python - <<'PY'
+from importlib.metadata import distribution
+from pathlib import Path
+
+package = distribution("mujoco-py")
+assert package.version == "2.1.2.14", package.version
+path = Path(package.locate_file("mujoco_py/gl/eglshim.c"))
+original = path.read_text()
+text = original
+anchor = '#include "glshim.h"\n'
+assert text.count(anchor) == 1, "Unexpected EGL include layout"
+headers = ("stdio.h", "string.h", "stdint.h")
+missing = [h for h in headers if f"#include <{h}>" not in text]
+text = text.replace(anchor, anchor + "".join(f"#include <{h}>\n" for h in missing))
+replacements = [
+    ('fprintf("glewInit error: %s\\n", glewGetErrorString(err));',
+     'fprintf(stderr, "glewInit error: %s\\n", glewGetErrorString(err));'),
+    ('bufferOffset * viewport.width * viewport.height * 3);',
+     '(void *)(uintptr_t)(bufferOffset * viewport.width * viewport.height * 3));'),
+    ('bufferOffset * viewport.width * viewport.height * sizeof(short));',
+     '(void *)(uintptr_t)(bufferOffset * viewport.width * viewport.height * sizeof(short)));'),
+]
+for old, new in replacements:
+    if text.count(old) == 1 and new not in text:
+        text = text.replace(old, new)
+    else:
+        assert text.count(new) == 1, "Unexpected EGL source: " + old
+if text != original:
+    backup = path.with_name(path.name + ".bak")
+    if not backup.exists():
+        backup.write_bytes(path.read_bytes())
+    path.write_text(text)
+print("EGL shim ready:", path)
+PY
+```
+
+Rebuild the extension after patching. The compatibility flags apply only to this command and preserve Conda's existing compiler flags. `MUJOCO_PY_FORCE_REBUILD` rebuilds the selected extension in the installed package's `generated/` directory:
+
+```bash
+CFLAGS="${CFLAGS-} -Wno-error=incompatible-pointer-types" \
+CXXFLAGS="${CXXFLAGS-} -Wno-error=incompatible-pointer-types" \
+MUJOCO_PY_FORCE_REBUILD=1 \
+  python -c "import mujoco_py; print('mujoco_py import OK:', mujoco_py.cymj.__file__)"
+```
+
+Check physics initialization:
 
 ```bash
 python - <<'PY'
@@ -243,6 +364,23 @@ print('MuJoCo physics initialization passed')
 PY
 ```
 
+On a server with an allocated NVIDIA GPU, also check EGL offscreen rendering. Use the appropriate EGL device index in place of `0`; it is not necessarily the logical PyTorch index after `CUDA_VISIBLE_DEVICES` remapping. Leave `MUJOCO_PY_FORCE_CPU` unset for this GPU check:
+
+```bash
+python - <<'PY'
+import mujoco_py
+
+assert "linuxgpuextensionbuilder" in mujoco_py.cymj.__file__, "CPU extension loaded"
+xml = '<mujoco><worldbody><body><geom type="sphere" size="0.1"/></body></worldbody></mujoco>'
+simulation = mujoco_py.MjSim(mujoco_py.load_model_from_xml(xml))
+simulation.step()
+context = mujoco_py.MjRenderContextOffscreen(simulation, device_id=0)
+pixels = simulation.render(64, 64)
+assert pixels.shape == (64, 64, 3), pixels.shape
+print("GPU EGL offscreen rendering passed")
+PY
+```
+
 The benchmark data must also include the policy-parameter shape metadata:
 
 ```text
@@ -250,7 +388,7 @@ experiments/offline_moo/data/mo_hopper_v2/params_shapes.pkl
 experiments/offline_moo/data/mo_swimmer_v2/params_shapes.pkl
 ```
 
-Keep the evaluator assets bundled with the MORL backend. The physics check above does not check these task-specific files.
+Keep the evaluator assets bundled with the MORL backend. The physics and rendering checks do not check these task-specific files.
 
 </details>
 
